@@ -227,8 +227,8 @@ wheels = [
 ]
 
 [[package]]
-name = "thumby"
-version = "0.1.0"
+name = "thumby-cli"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "av" },
@@ -240,10 +240,10 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "av", specifier = ">=9.0.0" },
-    { name = "pillow", specifier = ">=9.2.0" },
-    { name = "pymediainfo", specifier = ">=4.3" },
-    { name = "rich", specifier = ">=13.0.0" },
+    { name = "av", specifier = ">=14.0.0" },
+    { name = "pillow", specifier = ">=11.0.0" },
+    { name = "pymediainfo", specifier = ">=6.0.0" },
+    { name = "rich", specifier = ">=13.9.0" },
     { name = "typer", specifier = ">=0.15.0" },
 ]
 

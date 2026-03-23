@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -7,8 +8,11 @@ from typing import Callable
 from typing import cast
 
 import av
-from PIL import Image, ImageColor, ImageDraw, ImageFont
+from PIL import Image, ImageColor, ImageDraw, ImageFont, features
 from pymediainfo import MediaInfo
+
+MAX_ANIM_FRAMES = 120
+MAX_GIF_FRAMES = MAX_ANIM_FRAMES
 
 
 @dataclass(slots=True)
@@ -47,6 +51,123 @@ class Thumbnailer:
             progress_callback=progress_callback,
         )
         image.save(output_path, quality=self.params.jpeg_quality)
+
+    def create_and_save_animated_gif(
+        self,
+        video_path: Path,
+        output_path: Path,
+        gif_duration_seconds: float,
+        gif_fps: float,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> None:
+        targets = self._read_animation_targets(
+            video_path, gif_duration_seconds, gif_fps
+        )
+        frames_rgb = self._capture_animation_frames(
+            video_path,
+            targets,
+            progress_callback=progress_callback,
+        )
+        if not frames_rgb:
+            raise ValueError(f"Could not capture frames for GIF from: {video_path}")
+
+        palette_frames = self._frames_to_gif_palette(frames_rgb)
+        duration_ms = max(1, round(1000.0 / gif_fps))
+        palette_frames[0].save(
+            output_path,
+            format="GIF",
+            save_all=True,
+            append_images=palette_frames[1:],
+            duration=duration_ms,
+            loop=0,
+            optimize=True,
+        )
+
+    def create_and_save_animated_webp(
+        self,
+        video_path: Path,
+        output_path: Path,
+        anim_duration_seconds: float,
+        anim_fps: float,
+        quality: int = 80,
+        lossless: bool = False,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> None:
+        if not features.check("webp"):
+            raise ValueError(
+                "WebP is not supported by this Pillow build (libwebp). "
+                "Install a Pillow wheel with WebP support, or use --gif instead."
+            )
+
+        targets = self._read_animation_targets(
+            video_path, anim_duration_seconds, anim_fps
+        )
+        frames_rgb = self._capture_animation_frames(
+            video_path,
+            targets,
+            progress_callback=progress_callback,
+        )
+        if not frames_rgb:
+            raise ValueError(f"Could not capture frames for WebP from: {video_path}")
+
+        q = max(0, min(100, quality))
+        rgb = [f.convert("RGB") for f in frames_rgb]
+        duration_ms = max(1, round(1000.0 / anim_fps))
+        save_kw: dict[str, Any] = {
+            "format": "WEBP",
+            "save_all": True,
+            "append_images": rgb[1:],
+            "duration": duration_ms,
+            "loop": 0,
+            "lossless": lossless,
+            "method": 4,
+        }
+        if not lossless:
+            save_kw["quality"] = q
+        try:
+            rgb[0].save(output_path, **save_kw)
+        except OSError as exc:
+            raise ValueError(
+                f"Could not write animated WebP ({exc}). "
+                "Try --gif, or reinstall Pillow with full WebP support."
+            ) from exc
+
+    def _read_animation_targets(
+        self,
+        video_path: Path,
+        anim_duration_seconds: float,
+        anim_fps: float,
+    ) -> list[float]:
+        metadata = self._read_metadata(video_path)
+        duration_seconds = float(cast(float, metadata["duration_seconds"]))
+        if duration_seconds <= 0:
+            raise ValueError(f"Video has no valid duration: {video_path}")
+
+        if anim_fps <= 0:
+            raise ValueError("Animation fps must be positive")
+        if anim_duration_seconds <= 0:
+            raise ValueError("Animation duration must be positive")
+
+        skip = min(
+            max(self.params.skip_seconds, 0.0), max(duration_seconds - 0.001, 0.0)
+        )
+        timeline = duration_seconds - skip
+        if timeline <= 0:
+            skip = 0.0
+            timeline = duration_seconds
+
+        clip_end = min(skip + anim_duration_seconds, duration_seconds - 1e-6)
+        clip_len = clip_end - skip
+        if clip_len <= 0:
+            raise ValueError("No time left in video after skip for animated clip")
+
+        n_frames = min(
+            MAX_ANIM_FRAMES,
+            max(1, math.ceil(clip_len * anim_fps - 1e-9)),
+        )
+        return [
+            min(skip + (i + 0.5) / anim_fps, clip_end - 1e-9) for i in range(n_frames)
+        ]
 
     def create_preview_thumbnails_for(
         self,
@@ -174,6 +295,111 @@ class Thumbnailer:
             images.extend(last.copy() for _ in range(len(timestamps) - len(images)))
 
         return images
+
+    def _capture_animation_frames(
+        self,
+        video_path: Path,
+        targets: list[float],
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> list[Image.Image]:
+        total = len(targets)
+        if progress_callback is not None:
+            progress_callback(0, total)
+
+        images: list[Image.Image] = []
+        start_seek = max(0.0, targets[0])
+
+        with av.open(str(video_path)) as container:
+            stream = container.streams.video[0]
+            stream.thread_type = "AUTO"
+            stream.thread_count = 0
+            filter_graph, graph_src, graph_sink = self._build_scale_filter_graph(stream)
+
+            time_base = float(stream.time_base) if stream.time_base is not None else 0.0
+            if time_base <= 0.0:
+                return []
+
+            seek_position = int(start_seek / time_base)
+            if stream.start_time is not None:
+                seek_position += int(stream.start_time)
+
+            try:
+                container.seek(
+                    seek_position, stream=stream, any_frame=False, backward=True
+                )
+                codec_context = getattr(stream, "codec_context", None)
+                if codec_context is not None:
+                    codec_context.flush_buffers()
+            except Exception:
+                return []
+
+            t_idx = 0
+            prev_t: float | None = None
+            prev_img: Image.Image | None = None
+            done = 0
+
+            try:
+                for frame in container.decode(video=stream.index):
+                    if frame.pts is None:
+                        continue
+                    t = float(frame.pts * stream.time_base)
+                    img = self._filter_frame(
+                        frame, filter_graph, graph_src, graph_sink
+                    )
+
+                    if prev_t is None:
+                        while t_idx < len(targets) and targets[t_idx] <= t:
+                            images.append(img.copy())
+                            t_idx += 1
+                            done += 1
+                            if progress_callback is not None:
+                                progress_callback(done, total)
+                        prev_t, prev_img = t, img
+                        if t_idx >= len(targets):
+                            break
+                    else:
+                        while t_idx < len(targets) and targets[t_idx] <= t:
+                            d_prev = abs(targets[t_idx] - prev_t)
+                            d_cur = abs(targets[t_idx] - t)
+                            chosen = (
+                                prev_img.copy()
+                                if d_prev <= d_cur
+                                else img.copy()
+                            )
+                            images.append(chosen)
+                            t_idx += 1
+                            done += 1
+                            if progress_callback is not None:
+                                progress_callback(done, total)
+
+                        prev_t, prev_img = t, img
+                        if t_idx >= len(targets):
+                            break
+            except Exception:
+                return images
+
+            while t_idx < len(targets) and prev_img is not None:
+                images.append(prev_img.copy())
+                t_idx += 1
+                done += 1
+                if progress_callback is not None:
+                    progress_callback(done, total)
+
+        if images and len(images) < len(targets):
+            last = images[-1]
+            images.extend(last.copy() for _ in range(len(targets) - len(images)))
+
+        return images
+
+    def _frames_to_gif_palette(self, frames: list[Image.Image]) -> list[Image.Image]:
+        rgb = [f.convert("RGB") for f in frames]
+        base = rgb[0].quantize(colors=256, method=Image.Quantize.MEDIANCUT)
+        out: list[Image.Image] = [base]
+        for f in rgb[1:]:
+            out.append(
+                f.quantize(palette=base, dither=Image.Dither.FLOYDSTEINBERG)
+            )
+        return out
 
     def _build_scale_filter_graph(
         self,
